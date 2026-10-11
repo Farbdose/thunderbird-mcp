@@ -112,6 +112,9 @@ function loadGetMessage({ stream, log, findMessageError }) {
     "async function getMessages(",
     getMessageStart
   );
+  const offlineStart = source.indexOf("// BEGIN OFFLINE SYNC HELPERS");
+  const offlineEnd = source.indexOf("// END OFFLINE SYNC HELPERS");
+  assert.ok(offlineStart >= 0 && offlineEnd > offlineStart, "offline sync helper markers missing");
   assert.ok(helperStart >= 0, "raw MIME attachment helper start marker missing");
   assert.ok(helperEnd > helperStart, "raw MIME attachment helper end marker missing");
   assert.ok(getMessageStart >= 0, "getMessage missing");
@@ -149,6 +152,7 @@ function loadGetMessage({ stream, log, findMessageError }) {
   vm.createContext(sandbox);
   vm.runInContext(
     `${source.slice(helperStart, helperEnd)}
+${source.slice(offlineStart, offlineEnd)}
 ${source.slice(getMessageStart, getMessageEnd)}
 this.getMessage = getMessage;`,
     sandbox

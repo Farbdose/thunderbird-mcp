@@ -2664,6 +2664,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "syncFolder",
+        group: "folders", crud: "update",
+        title: "Sync Folder Offline",
+        description: "Mark an IMAP folder for offline use and download all messages that have no local copy yet (like 'Download now' in folder properties). Raw message sources are only readable from the local copy.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI (from listFolders)" },
+            timeoutMs: { type: "integer", description: "How long to wait for the download to finish (default 120000)" },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
         name: "emptyJunk",
         group: "folders", crud: "delete",
         title: "Empty Junk",
@@ -3428,6 +3442,139 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               return result;
             }
+
+            // BEGIN OFFLINE SYNC HELPERS
+            // Raw message sources are read from the local offline store only
+            // (folder.getMsgInputStream). IMAP folders without an offline copy of
+            // a message (not marked for offline use, or not yet downloaded after a
+            // move) fail that read; these helpers download on demand.
+            const FOLDER_FLAG_OFFLINE = 0x08000000;   // nsMsgFolderFlags.Offline
+            const MSG_FLAG_OFFLINE = 0x00000080;      // nsMsgMessageFlags.Offline
+            const OFFLINE_WAIT_MS = 20000;
+            const OFFLINE_POLL_MS = 200;
+
+            function isImapFolder(folder) {
+              try { return Boolean(folder && folder.server && folder.server.type === "imap"); } catch { return false; }
+            }
+
+            function hasOfflineCopy(msgHdr) {
+              try {
+                if (typeof msgHdr.folder.hasMsgOffline === "function") return Boolean(msgHdr.folder.hasMsgOffline(msgHdr.messageKey));
+              } catch { /* fall through to the header flag */ }
+              return Boolean(msgHdr.flags & MSG_FLAG_OFFLINE);
+            }
+
+            // The Experiment parent scope has no setTimeout; nsITimer is the timer
+            // available there. The returned timer must stay referenced until it fires.
+            function startOfflineTimer(callback, delayMs) {
+              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              timer.initWithCallback({ notify: callback }, delayMs, Ci.nsITimer.TYPE_ONE_SHOT);
+              return timer;
+            }
+
+            function waitUntil(predicate, timeoutMs, intervalMs = OFFLINE_POLL_MS) {
+              return new Promise((resolve) => {
+                const deadline = Date.now() + timeoutMs;
+                let timer = null;
+                const tick = () => {
+                  timer = null;
+                  let ok = false;
+                  try { ok = Boolean(predicate()); } catch { ok = false; }
+                  if (ok) return resolve(true);
+                  if (Date.now() >= deadline) return resolve(false);
+                  timer = startOfflineTimer(tick, intervalMs);
+                };
+                tick();
+              });
+            }
+
+            /**
+             * Download one message into the offline store if it is missing.
+             * Resolves true when a local copy exists afterwards (or was never needed).
+             */
+            function ensureOfflineCopy(msgHdr, timeoutMs = OFFLINE_WAIT_MS) {
+              if (!isImapFolder(msgHdr.folder) || hasOfflineCopy(msgHdr)) return Promise.resolve(true);
+              try {
+                msgHdr.folder.downloadMessagesForOffline([msgHdr], null);
+              } catch (e) {
+                console.error("thunderbird-mcp: downloadMessagesForOffline failed:", e);
+                return Promise.resolve(false);
+              }
+              return waitUntil(() => hasOfflineCopy(msgHdr), timeoutMs);
+            }
+
+            function countOfflineMessages(folder) {
+              let total = 0, offline = 0;
+              for (const hdr of folder.messages) {
+                total += 1;
+                if (hdr.flags & MSG_FLAG_OFFLINE) offline += 1;
+              }
+              return { total, offline };
+            }
+
+            /**
+             * Mark an IMAP folder for offline use (if not already) and download all
+             * messages that lack a local copy. Waits for completion up to timeoutMs.
+             */
+            async function syncFolder(folderPath, timeoutMs) {
+              if (typeof folderPath !== "string" || !folderPath) {
+                return { error: "folderPath must be a non-empty string" };
+              }
+              const found = getAccessibleFolder(folderPath);
+              if (found.error) return found;
+              const folder = found.folder;
+              const waitMs = Number.isInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : 120000;
+              try {
+                if (!isImapFolder(folder)) {
+                  const counts = countOfflineMessages(folder);
+                  return { success: true, folder: folder.URI, serverType: folder.server?.type ?? null,
+                           note: "not an IMAP folder; messages are stored locally", ...counts };
+                }
+                let offlineFlagSet = false;
+                if (!(folder.flags & FOLDER_FLAG_OFFLINE)) {
+                  folder.setFlag(FOLDER_FLAG_OFFLINE);
+                  offlineFlagSet = true;
+                }
+                const before = countOfflineMessages(folder);
+                const finished = new Promise((resolve) => {
+                  const listener = {
+                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                    OnStartRunningUrl() {},
+                    OnStopRunningUrl(_url, status) { resolve({ stopped: true, status }); },
+                  };
+                  try {
+                    folder.downloadAllForOffline(listener, null);
+                  } catch (e) {
+                    resolve({ stopped: false, error: e.toString() });
+                  }
+                });
+                let timeoutTimer = null;
+                const timeout = new Promise((resolve) => {
+                  timeoutTimer = startOfflineTimer(() => resolve({ stopped: false, timeout: true }), waitMs);
+                });
+                const outcome = await Promise.race([finished, timeout]);
+                timeoutTimer.cancel();
+                // The listener fires when the IMAP URL finishes; the store may lag a moment.
+                if (outcome.stopped) {
+                  await waitUntil(() => countOfflineMessages(folder).offline >= before.total, 2000);
+                }
+                const after = countOfflineMessages(folder);
+                return {
+                  success: !outcome.error,
+                  folder: folder.URI,
+                  offlineFlagSet,
+                  messages: after.total,
+                  offlineBefore: before.offline,
+                  offlineAfter: after.offline,
+                  completed: Boolean(outcome.stopped) && after.offline >= after.total,
+                  ...(outcome.timeout ? { note: `download still running after ${waitMs} ms` } : {}),
+                  ...(outcome.error ? { error: outcome.error } : {}),
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+            // END OFFLINE SYNC HELPERS
 
             /**
              * Best-effort refresh for IMAP folders. updateFolder starts async work
@@ -8433,7 +8580,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END ENCRYPTED MESSAGE GUARD
 
             // BEGIN MESSAGE READ TOOLS
-	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource, includeInlineImages) {
+	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource, includeInlineImages, afterDownload = false) {
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -8442,6 +8589,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    return;
 	                  }
 	                  const { msgHdr } = found;
+	
+	                  // Raw source needs the local copy; fetch it once, then retry this call.
+	                  if (rawSource && !afterDownload && isImapFolder(msgHdr.folder) && !hasOfflineCopy(msgHdr)) {
+	                    ensureOfflineCopy(msgHdr).then(() =>
+	                      resolve(getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource, includeInlineImages, true)));
+	                    return;
+	                  }
 
 	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
 	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
@@ -11399,6 +11553,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return emptyTrash(args.accountId);
                 case "emptyJunk":
                   return emptyJunk(args.accountId);
+                case "syncFolder":
+                  return await syncFolder(args.folderPath, args.timeoutMs);
                 case "moveFolder":
                   return moveFolder(args.folderPath, args.newParentPath);
                 case "listFilters":

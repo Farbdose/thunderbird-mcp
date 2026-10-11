@@ -73,6 +73,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     snippet("MESSAGE TEXT CONVERSION"), snippet("RAW MIME PARSING HELPERS"),
     snippet("RAW MIME ATTACHMENT HELPERS"), snippet("INLINE IMAGE CONTENT HELPERS"),
     snippet("INLINE ATTACHMENT BASE64 HELPERS"), snippet("ENCRYPTED MESSAGE GUARD"),
+    snippet("OFFLINE SYNC HELPERS"),
     snippet("MESSAGE READ TOOLS"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
   // The production stream reader is loaded with its helper block; serve the fixture instead.

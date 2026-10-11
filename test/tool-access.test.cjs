@@ -90,6 +90,7 @@ const ALL_TOOLS = [
   { name: "moveFolder", group: "folders", crud: "update" },
   { name: "deleteFolder", group: "folders", crud: "delete" },
   { name: "emptyTrash", group: "folders", crud: "delete" },
+  { name: "syncFolder", group: "folders", crud: "update" },
   { name: "emptyJunk", group: "folders", crud: "delete" },
   { name: "searchContacts", group: "contacts", crud: "read" },
   { name: "getContact", group: "contacts", crud: "read" },
