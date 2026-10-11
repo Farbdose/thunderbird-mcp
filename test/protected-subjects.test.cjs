@@ -75,6 +75,7 @@ function loadTools({ allowed = false, streamError = null } = {}) {
     openFolder: () => ({ folder, db: folder.msgDatabase }),
     getAccessibleAccounts: () => [],
     getUserTags: () => [],
+    Ci: { nsMsgMessageFlags: { Attachment: 0x10000000 } },
     DEFAULT_MAX_RESULTS: 50,
     MAX_SEARCH_RESULTS_CAP: 200,
     SEARCH_COLLECTION_CAP: 10000,
@@ -199,5 +200,46 @@ describe("displayMessage while encrypted message access is off", () => {
       assert.equal(result.success, true, result.error);
       assert.equal(h.stats.displayed, 1);
     }
+  });
+});
+
+describe("getRecentMessages size and attachment filters", () => {
+  const ATTACHMENT = 0x10000000;
+  function loadSized() {
+    const h = loadTools();
+    // Newest first: large with attachment, small with attachment, large plain, small plain.
+    Object.assign(h.add({ id: "small-plain", date: 1 }), { messageSize: 900 });
+    Object.assign(h.add({ id: "large-plain", date: 2 }), { messageSize: 6000000 });
+    Object.assign(h.add({ id: "small-attachment", date: 3 }), { messageSize: 1000, flags: ATTACHMENT | 0x1 });
+    Object.assign(h.add({ id: "large-attachment", date: 4 }), { messageSize: 5000000, flags: ATTACHMENT });
+    return h;
+  }
+  const recent = (h, minSize, hasAttachments, offset) =>
+    plain(h.api.getRecentMessages(h.folder.URI, 36500, undefined, offset, false, false, true, minSize, hasAttachments));
+
+  it("reports size and hasAttachments on every row", () => {
+    const rows = recent(loadSized());
+    assert.deepEqual(rows.map((row) => [row.id, row.size, row.hasAttachments]), [
+      ["large-attachment", 5000000, true], ["small-attachment", 1000, true],
+      ["large-plain", 6000000, false], ["small-plain", 900, false],
+    ]);
+  });
+
+  it("filters by minSize and by the attachment flag", () => {
+    const h = loadSized();
+    assert.deepEqual(recent(h, 5000000).map((row) => row.id), ["large-attachment", "large-plain"]);
+    assert.deepEqual(recent(h, undefined, true).map((row) => row.id), ["large-attachment", "small-attachment"]);
+    assert.deepEqual(recent(h, undefined, false).map((row) => row.id), ["large-plain", "small-plain"]);
+    assert.deepEqual(recent(h, 2000, true).map((row) => row.id), ["large-attachment"]);
+    assert.equal(recent(h, 1000, undefined, 0).totalMatches, 3);
+  });
+
+  it("reports zero for a header without a stored size and rejects invalid values", () => {
+    const h = loadTools();
+    h.add({ id: "unsized", date: 1 });
+    assert.deepEqual(recent(h).map((row) => [row.size, row.hasAttachments]), [[0, false]]);
+    assert.deepEqual(recent(h, -1), { error: "minSize must be a non-negative integer (bytes)" });
+    assert.deepEqual(recent(h, 2.5), { error: "minSize must be a non-negative integer (bytes)" });
+    assert.deepEqual(recent(h, undefined, "true"), { error: "hasAttachments must be a boolean" });
   });
 });

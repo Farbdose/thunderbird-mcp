@@ -153,7 +153,7 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
         },
       },
     },
-    Ci: { nsMsgMessageFlags: { Expunged: 0x8 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
+    Ci: { nsMsgMessageFlags: { Expunged: 0x8, Attachment: 0x10000000 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
     NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
       mimeConverter: { decodeMimeHeader: value => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")) },
@@ -230,7 +230,7 @@ describe("searchMessages production scan and pagination", () => {
       id: "m-1000@example.com", threadId: 1000,
       subject: "Decoded subject", author: "Alice Smith", recipients: "Bob Jones", ccList: "copy@example.com",
       date: new Date(1001000).toISOString(), folder: "Archive", folderPath: folder.URI,
-      read: false, flagged: true, tags: ["custom", "$label1"], preview: "A preview",
+      read: false, flagged: true, size: 0, hasAttachments: false, tags: ["custom", "$label1"], preview: "A preview",
     });
   });
 
@@ -640,5 +640,78 @@ describe("searchMessages protects subjects of encrypted mail", () => {
       }
       assert.equal(folder.rawReads, 0);
     }
+  });
+});
+
+describe("searchMessages size and attachment filters", () => {
+  const ATTACHMENT = 0x10000000;
+  // Index 0..3: small plain, large plain, small with attachment, large with attachment.
+  function sizedFolder() {
+    return makeFolder("Archive", { messages: [
+      { messageSize: 900, flags: 0 },
+      { messageSize: 6000000, flags: 0 },
+      { messageSize: 1000, flags: ATTACHMENT | 0x1 },
+      { messageSize: 5000000, flags: ATTACHMENT },
+    ] });
+  }
+  const ids = rows => rows.map(row => row.id);
+
+  it("reports size and hasAttachments on every row", async () => {
+    const h = makeHarness({ roots: [sizedFolder()] });
+    const rows = await h.search({ sortOrder: "asc" });
+    assert.deepEqual(rows.map(row => [row.size, row.hasAttachments]),
+      [[900, false], [6000000, false], [1000, true], [5000000, true]]);
+  });
+
+  it("filters by minSize with an inclusive bound", async () => {
+    const h = makeHarness({ roots: [sizedFolder()] });
+    assert.deepEqual(ids(await h.search({ minSize: 5000000, sortOrder: "asc" })), ["m-1@example.com", "m-3@example.com"]);
+    assert.deepEqual(ids(await h.search({ minSize: 5000001, sortOrder: "asc" })), ["m-1@example.com"]);
+    assert.equal((await h.search({ minSize: 0 })).length, 4);
+  });
+
+  it("filters by the attachment flag in both directions and combines with minSize", async () => {
+    const h = makeHarness({ roots: [sizedFolder()] });
+    assert.deepEqual(ids(await h.search({ hasAttachments: true, sortOrder: "asc" })), ["m-2@example.com", "m-3@example.com"]);
+    assert.deepEqual(ids(await h.search({ hasAttachments: false, sortOrder: "asc" })), ["m-0@example.com", "m-1@example.com"]);
+    assert.deepEqual(ids(await h.search({ hasAttachments: true, minSize: 2000 })), ["m-3@example.com"]);
+    assert.deepEqual(ids(await h.search({ hasAttachments: false, minSize: 7000000 })), []);
+  });
+
+  it("applies the filters to countOnly and to pagination totals", async () => {
+    const h = makeHarness({ roots: [sizedFolder()] });
+    assert.deepEqual(await h.search({ countOnly: true, minSize: 5000000 }), { count: 2 });
+    assert.deepEqual(await h.search({ countOnly: true, hasAttachments: false }), { count: 2 });
+    assert.deepEqual(await h.search({ countOnly: true, hasAttachments: true, minSize: 5000000 }), { count: 1 });
+    const page = await h.search({ offset: 0, maxResults: 1, minSize: 1000 });
+    assert.equal(page.totalMatches, 3);
+  });
+
+  it("treats a missing or invalid stored size as zero", async () => {
+    const folder = makeFolder("Archive", { messages: [{}, { messageSize: -5 }, { messageSize: 12.9 }] });
+    const h = makeHarness({ roots: [folder] });
+    assert.deepEqual((await h.search({ sortOrder: "asc" })).map(row => row.size), [0, 0, 12]);
+    assert.deepEqual(await h.search({ countOnly: true, minSize: 1 }), { count: 1 });
+  });
+
+  it("rejects invalid filter values before scanning", async () => {
+    const folder = sizedFolder();
+    const h = makeHarness({ roots: [folder] });
+    for (const minSize of [-1, 1.5, "big", NaN]) {
+      assert.deepEqual(await h.search({ minSize }), { error: "minSize must be a non-negative integer (bytes)" });
+    }
+    assert.deepEqual(await h.search({ hasAttachments: "yes" }), { error: "hasAttachments must be a boolean" });
+    assert.deepEqual(await h.search({ query: "x", searchBody: true, minSize: -1 }), { error: "minSize must be a non-negative integer (bytes)" });
+    assert.equal(folder.stats.snapshots, 0);
+  });
+
+  it("filters and annotates body-search results", async () => {
+    const folder = sizedFolder();
+    const glodaItems = Array.from(folder.headers.values(), folderMessage => ({ folderMessage }));
+    const h = makeHarness({ roots: [folder], glodaItems });
+    const result = await h.search({ query: "body", searchBody: true, offset: 0, sortOrder: "asc", hasAttachments: true, minSize: 2000 });
+    assert.deepEqual(result.messages.map(row => [row.id, row.size, row.hasAttachments]), [["m-3@example.com", 5000000, true]]);
+    const count = await h.search({ query: "body", searchBody: true, countOnly: true, minSize: 5000000 });
+    assert.equal(count.count, 2);
   });
 });

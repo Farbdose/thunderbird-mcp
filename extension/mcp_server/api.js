@@ -2073,6 +2073,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
+            minSize: { type: "integer", minimum: 0, description: "Only return messages whose size is at least this many bytes (e.g. 5000000 for about 5 MB). Results report each message's size in bytes." },
+            hasAttachments: { type: "boolean", description: "true: only messages flagged as having attachments; false: only messages without the flag; omit for no filter. On IMAP the flag is reliable only after Thunderbird has loaded the message (opened it or downloaded it for offline use); messages never loaded count as having no attachments." },
             tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." },
             includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
             countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries." },
@@ -2553,6 +2555,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 10000." },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
+            minSize: { type: "integer", minimum: 0, description: "Only return messages whose size is at least this many bytes (e.g. 5000000 for about 5 MB). Results report each message's size in bytes." },
+            hasAttachments: { type: "boolean", description: "true: only messages flagged as having attachments; false: only messages without the flag; omit for no filter. On IMAP the flag is reliable only after Thunderbird has loaded the message (opened it or downloaded it for offline use); messages never loaded count as having no attachments." },
             includeSubfolders: { type: "boolean", description: "If false, only return messages from the specified folder — not its subfolders. Default: true." },
           },
           required: [],
@@ -3136,6 +3140,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return deduped;
             }
 
+            /** Message size in bytes as recorded in the header (0 when unknown). */
+            function headerMessageSize(msgHdr) {
+              const size = Number(msgHdr.messageSize);
+              return Number.isFinite(size) && size > 0 ? Math.floor(size) : 0;
+            }
+
+            /**
+             * Attachment flag of the header. Thunderbird sets it while parsing the
+             * message body, so an IMAP message that was never loaded reads false.
+             */
+            function headerHasAttachments(msgHdr) {
+              return Boolean(msgHdr.flags & Ci.nsMsgMessageFlags.Attachment);
+            }
+
+            /**
+             * Size and attachment criteria shared by searchMessages and
+             * getRecentMessages. Returns { error } for invalid input, otherwise
+             * { matches(msgHdr) }; omitted criteria match every message.
+             */
+            function buildSizeAttachmentFilter(minSize, hasAttachments) {
+              const sizeGiven = minSize !== undefined && minSize !== null;
+              if (sizeGiven && (!Number.isInteger(minSize) || minSize < 0)) {
+                return { error: "minSize must be a non-negative integer (bytes)" };
+              }
+              const attachmentsGiven = hasAttachments !== undefined && hasAttachments !== null;
+              if (attachmentsGiven && typeof hasAttachments !== "boolean") {
+                return { error: "hasAttachments must be a boolean" };
+              }
+              return {
+                matches(msgHdr) {
+                  if (sizeGiven && headerMessageSize(msgHdr) < minSize) return false;
+                  if (attachmentsGiven && headerHasAttachments(msgHdr) !== hasAttachments) return false;
+                  return true;
+                },
+              };
+            }
+
             function searchTimeExpired(scan) {
               if (Date.now() < scan.deadline) return false;
               scan.truncated = true;
@@ -3201,6 +3242,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
+                      size: headerMessageSize(msgHdr),
+                      hasAttachments: headerHasAttachments(msgHdr),
                       tags: getUserTags(msgHdr),
                     };
                     if (preview) message.preview = preview;
@@ -5444,7 +5487,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * searchMessages. IMAP accounts need offline sync for body
              * indexing; without it only headers are searched.
              */
-            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId) {
+            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId, sizeAttachmentFilter) {
               // Gloda limits ranked candidates before excluding deleted/stale rows;
               // even a collection below that limit cannot prove completeness.
               const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: true, glodaLimited: true };
@@ -5534,6 +5577,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           // Boolean filters
                           if (unreadOnly && msgHdr.isRead) continue;
                           if (flaggedOnly && !msgHdr.isFlagged) continue;
+                          if (!sizeAttachmentFilter.matches(msgHdr)) continue;
                           if (tag) {
                             const keywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/);
                             if (!keywords.includes(tag)) continue;
@@ -5563,12 +5607,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-	            async function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
+	            async function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId, minSize, hasAttachments) {
+	              const sizeAttachmentFilter = buildSizeAttachmentFilter(minSize, hasAttachments);
+	              if (sizeAttachmentFilter.error) return { error: sizeAttachmentFilter.error };
 	              // Gloda full-body search path (async)
 	              if (searchBody) {
 	                if (!GlodaMsgSearcher) return { error: "Gloda full-text index is not available" };
 	                if (!query) return { error: "searchBody requires a non-empty query" };
-	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId);
+	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId, sizeAttachmentFilter);
 	              }
 	              const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
 	              const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
@@ -5621,6 +5667,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (endDateTs !== null && msgDateTs > endDateTs) return;
                 if (unreadOnly && msgHdr.isRead) return;
                 if (flaggedOnly && !msgHdr.isFlagged) return;
+                if (!sizeAttachmentFilter.matches(msgHdr)) return;
                 if (tag) {
                   const keywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/);
                   if (!keywords.includes(tag)) return;
@@ -10256,7 +10303,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "" };
             }
 
-            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
+            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders, minSize, hasAttachments) {
+              const sizeAttachmentFilter = buildSizeAttachmentFilter(minSize, hasAttachments);
+              if (sizeAttachmentFilter.error) return { error: sizeAttachmentFilter.error };
               const results = [];
               const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
@@ -10281,6 +10330,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (msgDateTs < cutoffTs) continue;
                     if (unreadOnly && msgHdr.isRead) continue;
                     if (flaggedOnly && !msgHdr.isFlagged) continue;
+                    if (!sizeAttachmentFilter.matches(msgHdr)) continue;
 
                     const msgTags = getUserTags(msgHdr);
                     const preview = msgHdr.getStringProperty("preview") || "";
@@ -10296,6 +10346,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
+                      size: headerMessageSize(msgHdr),
+                      hasAttachments: headerHasAttachments(msgHdr),
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
@@ -11494,7 +11546,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath, args.format, args.favoritesOnly);
                 case "searchMessages":
-                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody, args.dedupByMessageId);
+                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody, args.dedupByMessageId, args.minSize, args.hasAttachments);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource, args.includeInlineImages);
                 case "getMessages":
@@ -11536,7 +11588,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
                 case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
+                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders, args.minSize, args.hasAttachments);
                 case "displayMessage":
                   return displayMessage(args.messageId, args.folderPath, args.displayMode);
                 case "deleteMessages":
