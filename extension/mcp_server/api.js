@@ -3140,6 +3140,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return deduped;
             }
 
+            /**
+             * Canonical form for text comparison in searches: composed (NFC) and
+             * lower-cased. A decomposed spelling (base letter plus combining mark,
+             * as macOS and some mail clients produce) then equals its precomposed
+             * form, so both the query and every compared field go through here.
+             */
+            function foldForSearch(value) {
+              return String(value ?? "").normalize("NFC").toLowerCase();
+            }
+
             /** Message size in bytes as recorded in the header (0 when unknown). */
             function headerMessageSize(msgHdr) {
               const size = Number(msgHdr.messageSize);
@@ -5596,7 +5606,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       finish();
                     }
                   };
-                  searcher = new GlodaMsgSearcher(listener, query);
+                  // The index holds composed text; a decomposed query would miss it.
+                  searcher = new GlodaMsgSearcher(listener, String(query).normalize("NFC"));
                   searcher.getCollection();
                 } catch (e) {
                   if (timer) timer.cancel();
@@ -5619,7 +5630,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
 	              const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
 	              const results = [];
-	              const lowerQuery = (query || "").toLowerCase();
+	              const lowerQuery = foldForSearch(query);
 	              const hasQuery = !!lowerQuery;
 	              // Parse optional field-operator prefix and split into AND tokens.
 	              // Supports: from:Name, subject:Text, to:Email, cc:Email
@@ -5677,11 +5688,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Search decoded headers, preserving field operators and AND tokens.
                   // Cached subjects and previews of encrypted mail are not matched.
                   const protectedText = !allowEncrypted && hasRecordedEncryption(msgHdr);
-                  const subject = protectedText ? "" : (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
-                  const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
-                  const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
-                  const ccList = (msgHdr.ccList || "").toLowerCase();
-                  const preview = protectedText ? "" : (msgHdr.getStringProperty("preview") || "").toLowerCase();
+                  const subject = protectedText ? "" : foldForSearch(msgHdr.mime2DecodedSubject || msgHdr.subject);
+                  const author = foldForSearch(msgHdr.mime2DecodedAuthor || msgHdr.author);
+                  const recipients = foldForSearch(msgHdr.mime2DecodedRecipients || msgHdr.recipients);
+                  const ccList = foldForSearch(msgHdr.ccList);
+                  const preview = protectedText ? "" : foldForSearch(msgHdr.getStringProperty("preview"));
                   const fieldValues = { subject, author, recipients, ccList };
                   const matches = fieldTarget
                     ? queryTokens.every(t => (fieldValues[fieldTarget] || "").includes(t))

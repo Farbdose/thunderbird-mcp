@@ -114,8 +114,9 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
     static now() { return now; }
   }
   class GlodaMsgSearcher {
-    constructor(listener) {
+    constructor(listener, query) {
       this.listener = listener;
+      this.query = query;
       this.retrievalLimit = glodaLimit;
       searchers.push(this);
     }
@@ -713,5 +714,56 @@ describe("searchMessages size and attachment filters", () => {
     assert.deepEqual(result.messages.map(row => [row.id, row.size, row.hasAttachments]), [["m-3@example.com", 5000000, true]]);
     const count = await h.search({ query: "body", searchBody: true, countOnly: true, minSize: 5000000 });
     assert.equal(count.count, 2);
+  });
+});
+
+describe("searchMessages Unicode normalization", () => {
+  // "Über Café": precomposed (NFC) and decomposed (NFD) spellings of the same text.
+  const NFC = "\u00dcber Caf\u00e9";
+  const NFD = "U\u0308ber Cafe\u0301";
+  const fold = text => makeHarness().runtime.foldForSearch(text);
+
+  it("folds composed and decomposed spellings to the same string", () => {
+    assert.notEqual(NFC, NFD);
+    assert.equal(fold(NFC), fold(NFD));
+    assert.equal(fold(NFD), "\u00fcber caf\u00e9");
+    assert.equal(fold(undefined), "");
+    assert.equal(fold(null), "");
+  });
+
+  it("matches a composed subject with a decomposed query and the reverse", async () => {
+    const folder = makeFolder("Inbox", { messages: [
+      { mime2DecodedSubject: `Einladung ${NFC}` },
+      { mime2DecodedSubject: `Einladung ${NFD}` },
+      { mime2DecodedSubject: "Einladung Uber Cafe" },
+    ] });
+    const h = makeHarness({ roots: [folder] });
+    for (const query of [NFC, NFD, `subject:${NFD}`, `subject:${NFC}`, NFD.toUpperCase(), "caf\u00e9 \u00fcber"]) {
+      const rows = await h.search({ query, sortOrder: "asc" });
+      assert.deepEqual(rows.map(row => row.id), ["m-0@example.com", "m-1@example.com"], JSON.stringify(query));
+    }
+    assert.deepEqual(await h.search({ query: NFD, countOnly: true }), { count: 2 });
+  });
+
+  it("normalizes author, recipients, cc and preview as well", async () => {
+    const plainRow = { mime2DecodedSubject: "x", mime2DecodedAuthor: "a", mime2DecodedRecipients: "b", ccList: "c", properties: { preview: "d" } };
+    const folder = makeFolder("Inbox", { messages: [
+      { ...plainRow, mime2DecodedAuthor: `Ren${"e\u0301"} Example` },
+      { ...plainRow, mime2DecodedRecipients: `Zo${"e\u0308"} Example` },
+      { ...plainRow, ccList: `J${"o\u0308"}rg <copy@example.com>` },
+      { ...plainRow, properties: { preview: `Gr${"u\u0308"}\u00dfe aus dem B${"u\u0308"}ro` } },
+    ] });
+    const h = makeHarness({ roots: [folder] });
+    const hit = async query => (await h.search({ query })).map(row => row.id);
+    assert.deepEqual(await hit("from:ren\u00e9"), ["m-0@example.com"]);
+    assert.deepEqual(await hit("to:zo\u00eb"), ["m-1@example.com"]);
+    assert.deepEqual(await hit("cc:j\u00f6rg"), ["m-2@example.com"]);
+    assert.deepEqual(await hit("gr\u00fc\u00dfe b\u00fcro"), ["m-3@example.com"]);
+  });
+
+  it("hands a composed query to the body-search index", async () => {
+    const h = makeHarness({ glodaItems: [] });
+    await h.search({ query: NFD, searchBody: true });
+    assert.equal(h.searchers[0].query, NFC);
   });
 });
